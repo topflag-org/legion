@@ -698,11 +698,15 @@ impl Config {
                     let idx = Index::from(*idx);
                     call_params.push(quote!(components.#idx));
                 }
+                Parameter::Event(_) if single_event => call_params.push(quote!(&*events)),
+                Parameter::Event(idx) => {
+                    let idx = Index::from(*idx);
+                    call_params.push(quote!(&*events.#idx));
+                }
                 Parameter::Resource(_) if single_resource => call_params.push(quote!(&*resources)),
                 Parameter::ResourceMut(_) if single_resource => {
                     call_params.push(quote!(&mut *resources))
                 }
-                Parameter::Event(_) if single_event => call_params.push(quote!(&*events)),
                 Parameter::Resource(idx) => {
                     let idx = Index::from(*idx);
                     call_params.push(quote!(&*resources.#idx));
@@ -710,10 +714,6 @@ impl Config {
                 Parameter::ResourceMut(idx) => {
                     let idx = Index::from(*idx + signature.read_resources.len());
                     call_params.push(quote!(&mut *resources.#idx));
-                }
-                Parameter::Event(idx) => {
-                    let idx = Index::from(*idx);
-                    call_params.push(quote!(&*events.#idx));
                 }
                 Parameter::State(idx) => {
                     let arg_name = format_ident!("state_{}", idx);

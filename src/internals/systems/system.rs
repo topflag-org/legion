@@ -477,10 +477,10 @@ where
     pub fn build<F>(
         self,
         run_fn: F,
-    ) -> System<E, <R as ConsFlatten>::Output, <Q as ConsFlatten>::Output, F>
+    ) -> System<<E as ConsFlatten>::Output, <R as ConsFlatten>::Output, <Q as ConsFlatten>::Output, F>
     where
-        <R as ConsFlatten>::Output: for<'a> ResourceSet<'a>,
         <E as ConsFlatten>::Output: for<'a> EventSet<'a>,
+        <R as ConsFlatten>::Output: for<'a> ResourceSet<'a>,
         <Q as ConsFlatten>::Output: QuerySet,
         F: FnMut(
             &mut CommandBuffer,

@@ -18,8 +18,16 @@ fn basic_system() {
 #[test]
 #[cfg(feature = "codegen")]
 fn for_each_system() {
+    struct IterSystem;
+    struct IterSystem2;
+
     #[system(for_each)]
     fn sum(component: &usize, #[resource] total: &mut usize) {
+        *total += component;
+    }
+
+    #[system(for_each)]
+    fn sum2(component: &usize, #[event] ev1: &IterSystem, #[event] ev2: &IterSystem2, #[resource] total: &mut usize) {
         *total += component;
     }
 
