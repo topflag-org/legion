@@ -20,6 +20,7 @@ use itertools::izip;
 use super::{
     command::CommandBuffer,
     resources::{ResourceTypeId, Resources, UnsafeResources},
+    events::{EventTypeId, Events, UnsafeEvents},
     system::SystemId,
 };
 use crate::internals::{
@@ -46,6 +47,9 @@ pub trait Runnable {
     /// Gets the resources and component types written by the system.
     fn writes(&self) -> (&[ResourceTypeId], &[ComponentTypeId]);
 
+    /// Gets the input events required to execute a System.
+    fn events(&self) -> &[EventTypeId];
+
     /// Prepares the system for execution against a world.
     fn prepare(&mut self, world: &World);
 
@@ -62,14 +66,14 @@ pub trait Runnable {
     ///
     /// Additionally, systems which are !Sync should never be invoked on a different thread to that which
     /// owns the resources collection passed into this function.
-    unsafe fn run_unsafe(&mut self, world: &World, resources: &UnsafeResources);
+    unsafe fn run_unsafe(&mut self, world: &World, events: &UnsafeEvents, resources: &UnsafeResources);
 
     /// Gets the system's command buffer.
     fn command_buffer_mut(&mut self, world: WorldId) -> Option<&mut CommandBuffer>;
 
     /// Runs the system.
-    fn run(&mut self, world: &mut World, resources: &mut Resources) {
-        unsafe { self.run_unsafe(world, resources.internal()) };
+    fn run(&mut self, world: &mut World, events: &Events, resources: &mut Resources) {
+        unsafe { self.run_unsafe(world, events.internal(), resources.internal()) };
     }
 }
 
@@ -282,17 +286,19 @@ impl Executor {
 
     /// Executes all systems and then flushes their command buffers.
     #[cfg(not(feature = "parallel"))]
-    pub fn execute(&mut self, world: &mut World, resources: &mut Resources) {
+    pub fn execute(&mut self, world: &mut World, events: &Events, resources: &mut Resources) {
         let resources = resources.internal();
-        self.run_systems(world, resources);
+        let events = events.internal();
+        self.run_systems(world, events, resources);
         self.flush_command_buffers(world);
     }
 
     /// Executes all systems and then flushes their command buffers.
     #[cfg(feature = "parallel")]
-    pub fn execute(&mut self, world: &mut World, resources: &mut Resources) {
+    pub fn execute(&mut self, world: &mut World, events: &Events, resources: &mut Resources) {
         let resources = resources.internal();
-        rayon::join(|| self.run_systems(world, resources), || {});
+        let events = events.internal();
+        rayon::join(|| self.run_systems(world, events, resources), || {});
         self.flush_command_buffers(world);
     }
 
@@ -300,11 +306,11 @@ impl Executor {
     ///
     /// Only enabled with parallel is disabled
     #[cfg(not(feature = "parallel"))]
-    pub fn run_systems(&mut self, world: &mut World, resources: &UnsafeResources) {
+    pub fn run_systems(&mut self, world: &mut World, events: &UnsafeEvents, resources: &UnsafeResources) {
         self.systems.iter_mut().for_each(|system| {
             let system = unsafe { system.get_mut() };
             system.prepare(world);
-            unsafe { system.run_unsafe(world, resources) };
+            unsafe { system.run_unsafe(world, events, resources) };
         });
     }
 
@@ -315,14 +321,14 @@ impl Executor {
     ///
     /// Call from within `rayon::ThreadPool::install()` to execute within a specific thread pool.
     #[cfg(feature = "parallel")]
-    pub fn run_systems(&mut self, world: &mut World, resources: &UnsafeResources) {
+    pub fn run_systems(&mut self, world: &mut World, events: &UnsafeEvents, resources: &UnsafeResources) {
         match self.systems.len() {
             1 => {
                 // safety: we have exlusive access to all systems, world and resources here
                 unsafe {
                     let system = self.systems[0].get_mut();
                     system.prepare(world);
-                    system.run_unsafe(world, resources);
+                    system.run_unsafe(world, events, resources);
                 };
             }
             _ => {
@@ -375,7 +381,7 @@ impl Executor {
                     .for_each(|i| {
                         // safety: we are at the root of the execution tree, so we know each
                         // index is exclusive here
-                        unsafe { self.run_recursive(i, world, resources) };
+                        unsafe { self.run_recursive(i, world, events, resources) };
                     });
 
                 debug_assert!(
@@ -404,14 +410,14 @@ impl Executor {
     ///
     /// Ensure the system indexed by `i` is only accessed once.
     #[cfg(feature = "parallel")]
-    unsafe fn run_recursive(&self, i: usize, world: &World, resources: &UnsafeResources) {
+    unsafe fn run_recursive(&self, i: usize, world: &World, events: &UnsafeEvents, resources: &UnsafeResources) {
         // safety: the caller ensures nothing else is accessing systems[i]
-        self.systems[i].get_mut().run_unsafe(world, resources);
+        self.systems[i].get_mut().run_unsafe(world, events, resources);
 
         self.static_dependants[i].par_iter().for_each(|dep| {
             if self.awaiting[*dep].fetch_sub(1, Ordering::Relaxed) == 1 {
                 // safety: each dependency is unique, so run_recursive is safe to call
-                self.run_recursive(*dep, world, resources);
+                self.run_recursive(*dep, world, events, resources);
             }
         });
     }
@@ -447,18 +453,6 @@ impl Builder {
         }
     }
 
-    /// Adds a thread local function to the schedule. This function will be executed on the main thread.
-    pub fn add_thread_local_fn<F: FnMut(&mut World, &mut Resources) + 'static>(
-        &mut self,
-        f: F,
-    ) -> &mut Self {
-        self.finalize_executor();
-        self.steps.push(Step::ThreadLocalFn(
-            Box::new(f) as Box<dyn FnMut(&mut World, &mut Resources)>
-        ));
-        self
-    }
-
     /// Adds a thread local system to the schedule. This system will be executed on the main thread.
     pub fn add_thread_local<S: Runnable + 'static>(&mut self, system: S) -> &mut Self {
         self.finalize_executor();
@@ -491,8 +485,6 @@ pub enum Step {
     Systems(Executor),
     /// Flush system command buffers.
     FlushCmdBuffers,
-    /// A thread local function.
-    ThreadLocalFn(Box<dyn FnMut(&mut World, &mut Resources)>),
     /// A thread local system
     ThreadLocalSystem(Box<dyn Runnable>),
 }
@@ -503,11 +495,12 @@ pub enum Step {
 ///
 /// ```rust
 /// # use legion::*;
-/// # let find_collisions = SystemBuilder::new("find_collisions").build(|_,_,_,_| {});
-/// # let calculate_acceleration = SystemBuilder::new("calculate_acceleration").build(|_,_,_,_| {});
-/// # let update_positions = SystemBuilder::new("update_positions").build(|_,_,_,_| {});
+/// # let find_collisions = SystemBuilder::new("find_collisions").build(|_,_,_,_,_| {});
+/// # let calculate_acceleration = SystemBuilder::new("calculate_acceleration").build(|_,_,_,_,_| {});
+/// # let update_positions = SystemBuilder::new("update_positions").build(|_,_,_,_,_| {});
 /// let mut world = World::default();
 /// let mut resources = Resources::default();
+/// let mut events = Events::default();
 /// let mut schedule = Schedule::builder()
 ///     .add_system(find_collisions)
 ///     .flush()
@@ -515,7 +508,7 @@ pub enum Step {
 ///     .add_system(update_positions)
 ///     .build();
 ///
-/// schedule.execute(&mut world, &mut resources);
+/// schedule.execute(&mut world, &events, &mut resources);
 /// ```
 pub struct Schedule {
     steps: Vec<Step>,
@@ -529,18 +522,19 @@ impl Schedule {
 
     /// Executes all of the steps in the schedule.
     #[cfg(not(feature = "parallel"))]
-    pub fn execute(&mut self, world: &mut World, resources: &mut Resources) {
-        self.execute_internal(world, resources, |world, resources, executor| {
-            executor.run_systems(world, resources.internal())
+    pub fn execute(&mut self, world: &mut World, events: &Events, resources: &mut Resources) {
+        self.execute_internal(world, events, resources, |world, events, resources, executor| {
+            executor.run_systems(world, events.internal(), resources.internal())
         });
     }
 
     /// Executes all of the steps in the schedule.
     #[cfg(feature = "parallel")]
-    pub fn execute(&mut self, world: &mut World, resources: &mut Resources) {
-        self.execute_internal(world, resources, |world, resources, executor| {
+    pub fn execute(&mut self, world: &mut World, events: &Events, resources: &mut Resources) {
+        self.execute_internal(world, events, resources, |world, events, resources, executor| {
             let resources = resources.internal();
-            rayon::join(|| executor.run_systems(world, resources), || {});
+            let events = events.internal();
+            rayon::join(|| executor.run_systems(world, events, resources), || {});
         });
     }
 
@@ -550,18 +544,21 @@ impl Schedule {
     pub fn execute_in_thread_pool(
         &mut self,
         world: &mut World,
+        events: &Events,
         resources: &mut Resources,
         pool: &rayon::ThreadPool,
     ) {
-        self.execute_internal(world, resources, |world, resources, executor| {
+        self.execute_internal(world, events, resources, |world, events, resources, executor| {
             let resources = resources.internal();
-            pool.install(|| executor.run_systems(world, resources));
+            let events = events.internal();
+            pool.install(|| executor.run_systems(world, events, resources));
         });
     }
 
-    fn execute_internal<F: FnMut(&mut World, &mut Resources, &mut Executor)>(
+    fn execute_internal<F: FnMut(&mut World, &Events, &mut Resources, &mut Executor)>(
         &mut self,
         world: &mut World,
+        events: &Events,
         resources: &mut Resources,
         mut run_executor: F,
     ) {
@@ -574,7 +571,7 @@ impl Schedule {
         for step in &mut self.steps {
             match step {
                 Step::Systems(executor) => {
-                    run_executor(world, resources, executor);
+                    run_executor(world, events, resources, executor);
                     waiting_flush.push(ToFlush::Executor(executor));
                 }
                 Step::FlushCmdBuffers => {
@@ -583,10 +580,9 @@ impl Schedule {
                         ToFlush::System(cmd) => cmd.flush(world),
                     });
                 }
-                Step::ThreadLocalFn(function) => function(world, resources),
                 Step::ThreadLocalSystem(system) => {
                     system.prepare(world);
-                    system.run(world, resources);
+                    system.run(world, events, resources);
                     if let Some(cmd) = system.command_buffer_mut(world.id()) {
                         waiting_flush.push(ToFlush::System(cmd));
                     }
@@ -632,21 +628,22 @@ mod tests {
 
         let mut resources = Resources::default();
         resources.insert(Resource);
+        let mut events = Events::default();
 
         let order = Arc::new(Mutex::new(Vec::new()));
 
         let order_clone = order.clone();
         let system_one = SystemBuilder::new("one")
             .write_resource::<Resource>()
-            .build(move |_, _, _, _| order_clone.lock().unwrap().push(1usize));
+            .build(move |_, _, _, _, _| order_clone.lock().unwrap().push(1usize));
         let order_clone = order.clone();
         let system_two = SystemBuilder::new("two")
             .write_resource::<Resource>()
-            .build(move |_, _, _, _| order_clone.lock().unwrap().push(2usize));
+            .build(move |_, _, _, _, _| order_clone.lock().unwrap().push(2usize));
         let order_clone = order.clone();
         let system_three = SystemBuilder::new("three")
             .write_resource::<Resource>()
-            .build(move |_, _, _, _| order_clone.lock().unwrap().push(3usize));
+            .build(move |_, _, _, _, _| order_clone.lock().unwrap().push(3usize));
 
         let mut schedule = Schedule::builder()
             .add_system(system_one)
@@ -654,7 +651,7 @@ mod tests {
             .add_system(system_three)
             .build();
 
-        schedule.execute(&mut world, &mut resources);
+        schedule.execute(&mut world, &events, &mut resources);
 
         let order = order.lock().unwrap();
         let sorted: Vec<usize> = sorted(order.clone()).collect();
@@ -665,21 +662,22 @@ mod tests {
     fn flush() {
         let mut world = World::default();
         let mut resources = Resources::default();
+        let mut events = Events::default();
 
         #[derive(Clone, Copy, Debug, PartialEq)]
         struct TestComp(f32, f32, f32);
 
-        let system_one = SystemBuilder::new("one").build(move |cmd, _, _, _| {
+        let system_one = SystemBuilder::new("one").build(move |cmd, _, _, _, _| {
             cmd.push((TestComp(0., 0., 0.),));
         });
         let system_two = SystemBuilder::new("two")
             .with_query(Write::<TestComp>::query())
-            .build(move |_, world, _, query| {
+            .build(move |_, world, _, _, query| {
                 assert_eq!(0, query.iter_mut(world).count());
             });
         let system_three = SystemBuilder::new("three")
             .with_query(Write::<TestComp>::query())
-            .build(move |_, world, _, query| {
+            .build(move |_, world, _, _, query| {
                 assert_eq!(1, query.iter_mut(world).count());
             });
 
@@ -690,13 +688,14 @@ mod tests {
             .add_system(system_three)
             .build();
 
-        schedule.execute(&mut world, &mut resources);
+        schedule.execute(&mut world, &events, &mut resources);
     }
 
     #[test]
     fn flush_thread_local() {
         let mut world = World::default();
         let mut resources = Resources::default();
+        let mut events = Events::default();
 
         #[derive(Clone, Copy, Debug, PartialEq)]
         struct TestComp(f32, f32, f32);
@@ -706,14 +705,14 @@ mod tests {
         {
             let entity = entity.clone();
 
-            let system_one = SystemBuilder::new("one").build(move |cmd, _, _, _| {
+            let system_one = SystemBuilder::new("one").build(move |cmd, _, _, _, _| {
                 let mut entity = entity.lock().unwrap();
                 *entity = Some(cmd.push((TestComp(0.0, 0.0, 0.0),)));
             });
 
             let mut schedule = Schedule::builder().add_thread_local(system_one).build();
 
-            schedule.execute(&mut world, &mut resources);
+            schedule.execute(&mut world, &events, &mut resources);
         }
 
         let entity = entity.lock().unwrap();
@@ -726,6 +725,7 @@ mod tests {
     fn thread_local_resource() {
         let mut world = World::default();
         let mut resources = Resources::default();
+        let mut events = Events::default();
 
         #[derive(Clone, Copy, Debug, PartialEq)]
         struct NotSync(*const u8);
@@ -734,13 +734,13 @@ mod tests {
 
         let system = SystemBuilder::new("one")
             .read_resource::<NotSync>()
-            .build(move |_, _, _, _| {});
+            .build(move |_, _, _, _, _| {});
 
         let mut schedule = Schedule::builder().add_thread_local(system).build();
 
         // this should not compile
         // let mut schedule = Schedule::builder().add_system(system).build();
 
-        schedule.execute(&mut world, &mut resources);
+        schedule.execute(&mut world, &events, &mut resources);
     }
 }

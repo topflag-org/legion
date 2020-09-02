@@ -287,6 +287,7 @@ struct Sig {
     query: Vec<Type>,
     read_resources: Vec<Type>,
     write_resources: Vec<Type>,
+    events: Vec<Type>,
     state_args: Vec<Type>,
     generics: Generics,
 }
@@ -297,6 +298,7 @@ impl Sig {
         let mut query = Vec::<Type>::new();
         let mut read_resources = Vec::new();
         let mut write_resources = Vec::new();
+        let mut events = Vec::new();
         let mut state_args = Vec::new();
         for param in &mut item.inputs {
             match param {
@@ -383,6 +385,10 @@ impl Sig {
                                     read_resources.push(ty.elem.as_ref().clone());
                                 }
                             }
+                            Some(ArgAttr::Event) => {
+                                parameters.push(Parameter::Event(events.len()));
+                                events.push(ty.elem.as_ref().clone());
+                            }
                             Some(ArgAttr::State) => {
                                 if mutable {
                                     parameters.push(Parameter::StateMut(state_args.len()));
@@ -414,6 +420,7 @@ impl Sig {
             query,
             read_resources,
             write_resources,
+            events,
             state_args,
         })
     }
@@ -424,6 +431,10 @@ impl Sig {
                 Some(ident) if ident == "resource" => {
                     attributes.remove(i);
                     return Some(ArgAttr::Resource);
+                }
+                Some(ident) if ident == "event" => {
+                    attributes.remove(i);
+                    return Some(ArgAttr::Event);
                 }
                 Some(ident) if ident == "state" => {
                     attributes.remove(i);
@@ -438,6 +449,7 @@ impl Sig {
 
 enum ArgAttr {
     Resource,
+    Event,
     State,
 }
 
@@ -477,6 +489,7 @@ enum Parameter {
     Component(usize),
     Resource(usize),
     ResourceMut(usize),
+    Event(usize),
     State(usize),
     StateMut(usize),
 }
@@ -648,6 +661,7 @@ impl Config {
         let has_query = !signature.query.is_empty();
         let single_resource =
             (signature.read_resources.len() + signature.write_resources.len()) == 1;
+        let single_event = signature.events.len() == 1;
         let mut call_params = Vec::new();
         let mut fn_params = Vec::new();
         let mut world = None;
@@ -688,6 +702,7 @@ impl Config {
                 Parameter::ResourceMut(_) if single_resource => {
                     call_params.push(quote!(&mut *resources))
                 }
+                Parameter::Event(_) if single_event => call_params.push(quote!(&*events)),
                 Parameter::Resource(idx) => {
                     let idx = Index::from(*idx);
                     call_params.push(quote!(&*resources.#idx));
@@ -695,6 +710,10 @@ impl Config {
                 Parameter::ResourceMut(idx) => {
                     let idx = Index::from(*idx + signature.read_resources.len());
                     call_params.push(quote!(&mut *resources.#idx));
+                }
+                Parameter::Event(idx) => {
+                    let idx = Index::from(*idx);
+                    call_params.push(quote!(&*events.#idx));
                 }
                 Parameter::State(idx) => {
                     let arg_name = format_ident!("state_{}", idx);
@@ -753,6 +772,7 @@ impl Config {
         };
         let read_resources = &signature.read_resources;
         let write_resources = &signature.write_resources;
+        let events = &signature.events;
         let builder = quote! {
             use legion::IntoQuery;
             #generic_parameter_names
@@ -761,8 +781,9 @@ impl Config {
                 #(.write_component::<#write_components>())*
                 #(.read_resource::<#read_resources>())*
                 #(.write_resource::<#write_resources>())*
+                #(.request_event::<#events>())*
                 #query
-                .build(move |cmd, world, resources, query| {
+                .build(move |cmd, world, events, resources, query| {
                     #body
                 })
         };

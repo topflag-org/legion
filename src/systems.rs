@@ -2,6 +2,9 @@
 
 pub use crate::internals::systems::{
     command::{CommandBuffer, WorldWritable},
+    events::{
+        Event, EventSet, EventTypeId, Events, SyncEvents, UnsafeEvents,
+    },
     resources::{
         Fetch, Resource, ResourceSet, ResourceTypeId, Resources, SyncResources, UnsafeResources,
     },

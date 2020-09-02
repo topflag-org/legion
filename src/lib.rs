@@ -152,6 +152,7 @@
 //! # struct Time { elapsed_seconds: f32 }
 //! # let mut world = World::default();
 //! # let mut resources = Resources::default();
+//! # let mut events = Events::default();
 //! # resources.insert(Time { elapsed_seconds: 0.0 });
 //! // a system fn which loops through Position and Velocity components, and reads
 //! // the Time shared resource.
@@ -167,7 +168,7 @@
 //!     .build();
 //!
 //! // run our schedule (you should do this each update)
-//! schedule.execute(&mut world, &mut resources);
+//! schedule.execute(&mut world, &events, &mut resources);
 //! # }
 //! ```
 //!
@@ -201,7 +202,7 @@ pub use crate::{
         Write,
     },
     storage::{GroupSource, IntoSoa},
-    systems::{Resources, Schedule, SystemBuilder},
+    systems::{Resources, Schedule, SystemBuilder, Events},
     world::{Entity, EntityStore, World, WorldOptions},
 };
 

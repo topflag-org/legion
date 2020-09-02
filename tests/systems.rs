@@ -12,7 +12,7 @@ fn basic_system() {
     let mut world = World::default();
     let mut schedule = Schedule::builder().add_system(hello_world_system()).build();
 
-    schedule.execute(&mut world, &mut Resources::default());
+    schedule.execute(&mut world, &Events::default(), &mut Resources::default());
 }
 
 #[test]
@@ -29,9 +29,11 @@ fn for_each_system() {
     let mut resources = Resources::default();
     resources.insert(0usize);
 
+    let mut events = Events::default();
+
     let mut schedule = Schedule::builder().add_system(sum_system()).build();
 
-    schedule.execute(&mut world, &mut resources);
+    schedule.execute(&mut world, &events, &mut resources);
     assert_eq!(*resources.get::<usize>().unwrap(), 6usize);
 }
 
@@ -54,6 +56,7 @@ fn query_get() {
     let mut schedule = Schedule::builder().add_system(sys_system(entity)).build();
 
     let mut resources = Resources::default();
+    let mut events = Events::default();
 
-    schedule.execute(&mut world, &mut resources);
+    schedule.execute(&mut world, &events, &mut resources);
 }

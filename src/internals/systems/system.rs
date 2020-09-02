@@ -3,6 +3,7 @@
 use super::{
     command::CommandBuffer,
     resources::{Resource, ResourceSet, ResourceTypeId, UnsafeResources},
+    events::{Event, EventSet, EventTypeId, UnsafeEvents},
     schedule::Runnable,
 };
 use crate::internals::{
@@ -23,6 +24,7 @@ use crate::internals::{
 use bit_set::BitSet;
 use std::{any::TypeId, borrow::Cow, collections::HashMap, marker::PhantomData};
 use tracing::{debug, info, span, Level};
+use smallvec::SmallVec;
 
 /// Provides an abstraction across tuples of queries for system closures.
 pub trait QuerySet: Send + Sync {
@@ -113,6 +115,10 @@ struct ResourceMarker<T>(PhantomData<*const T>);
 unsafe impl<T: Send> Send for ResourceMarker<T> {}
 unsafe impl<T: Sync> Sync for ResourceMarker<T> {}
 
+struct EventMarker<T>(PhantomData<*const T>);
+unsafe impl<T: Send> Send for EventMarker<T> {}
+unsafe impl<T: Sync> Sync for EventMarker<T> {}
+
 /// The concrete type which contains the system closure provided by the user.  This struct should
 /// not be constructed directly, and instead should be created using `SystemBuilder`.
 ///
@@ -120,24 +126,31 @@ unsafe impl<T: Sync> Sync for ResourceMarker<T> {}
 ///
 /// Also handles caching of archetype information, as well as maintaining the provided
 /// information about what queries this system will run and, as a result, its data access.
-pub struct System<R, Q, F> {
+pub struct System<E, R, Q, F> {
     name: Option<SystemId>,
+    _events: EventMarker<E>,
     _resources: ResourceMarker<R>,
     queries: Q,
     run_fn: F,
     archetypes: ArchetypeAccess,
     access: SystemAccess,
+    event_types: SmallVec<[EventTypeId; 2]>,
     command_buffer: HashMap<WorldId, CommandBuffer>,
 }
 
-impl<R, Q, F> Runnable for System<R, Q, F>
+impl<E, R, Q, F> Runnable for System<E, R, Q, F>
 where
+    E: for<'a> EventSet<'a>,
     R: for<'a> ResourceSet<'a>,
     Q: QuerySet,
-    F: SystemFn<R, Q>,
+    F: SystemFn<E, R, Q>,
 {
     fn name(&self) -> Option<&SystemId> {
         self.name.as_ref()
+    }
+
+    fn events(&self) -> &[EventTypeId] {
+        self.event_types.as_slice()
     }
 
     fn reads(&self) -> (&[ResourceTypeId], &[ComponentTypeId]) {
@@ -168,7 +181,7 @@ where
         self.command_buffer.get_mut(&world)
     }
 
-    unsafe fn run_unsafe(&mut self, world: &World, resources: &UnsafeResources) {
+    unsafe fn run_unsafe(&mut self, world: &World, events: &UnsafeEvents, resources: &UnsafeResources) {
         let span = if let Some(name) = &self.name {
             span!(Level::INFO, "System", system = %name)
         } else {
@@ -188,6 +201,9 @@ where
         let resources_static = &*(resources as *const UnsafeResources);
         let mut resources = R::fetch_unchecked(resources_static);
 
+        let events_static = &*(events as *const UnsafeEvents);
+        let events = E::fetch_unchecked(events_static);
+
         let queries = &mut self.queries;
         let component_access = ComponentAccess::Allow(Cow::Borrowed(&self.access.components));
         let mut world_shim =
@@ -199,36 +215,39 @@ where
 
         info!("Running");
         let borrow = &mut self.run_fn;
-        borrow.run(cmd, &mut world_shim, &mut resources, queries);
+        borrow.run(cmd, &mut world_shim, &events, &mut resources, queries);
     }
 }
 
 /// A function which can provide the body of a system.
-pub trait SystemFn<R: ResourceSet<'static>, Q: QuerySet> {
+pub trait SystemFn<E: EventSet<'static>, R: ResourceSet<'static>, Q: QuerySet> {
     /// Runs the system body.
     fn run(
         &mut self,
         commands: &mut CommandBuffer,
         world: &mut SubWorld,
+        events: &E::Result,
         resources: &mut R::Result,
         queries: &mut Q,
     );
 }
 
-impl<F, R, Q> SystemFn<R, Q> for F
+impl<E, F, R, Q> SystemFn<E, R, Q> for F
 where
+    E: EventSet<'static>,
     R: ResourceSet<'static>,
     Q: QuerySet,
-    F: FnMut(&mut CommandBuffer, &mut SubWorld, &mut R::Result, &mut Q) + 'static,
+    F: FnMut(&mut CommandBuffer, &mut SubWorld, &E::Result, &mut R::Result, &mut Q) + 'static,
 {
     fn run(
         &mut self,
         commands: &mut CommandBuffer,
         world: &mut SubWorld,
+        events: &E::Result,
         resources: &mut R::Result,
         queries: &mut Q,
     ) {
-        (self)(commands, world, resources, queries)
+        (self)(commands, world, events, resources, queries)
     }
 }
 
@@ -255,22 +274,24 @@ where
 ///            .read_resource::<TestResource>()
 ///            .with_query(<(Entity, Read<Position>, Read<Model>)>::query()
 ///                         .filter(!component::<Static>() | maybe_changed::<Position>()))
-///            .build(move |commands, world, resource, queries| {
+///            .build(move |commands, world, events, resource, queries| {
 ///                for (entity, pos, model) in queries.iter_mut(world) {
 ///
 ///                }
 ///            });
 /// ```
-pub struct SystemBuilder<Q = (), R = ()> {
+pub struct SystemBuilder<Q = (), R = (), E = ()> {
     name: Option<SystemId>,
     queries: Q,
     resources: R,
+    events: E,
+    event_types: SmallVec<[EventTypeId;2]>,
     resource_access: Permissions<ResourceTypeId>,
     component_access: Permissions<ComponentTypeId>,
     access_all_archetypes: bool,
 }
 
-impl SystemBuilder<(), ()> {
+impl SystemBuilder<(), (), ()> {
     /// Create a new system builder to construct a new system.
     ///
     /// Please note, the `name` argument for this method is just for debugging and visualization
@@ -283,12 +304,14 @@ impl SystemBuilder<(), ()> {
     }
 }
 
-impl Default for SystemBuilder<(), ()> {
+impl Default for SystemBuilder<(), (), ()> {
     fn default() -> Self {
         Self {
             name: None,
             queries: (),
             resources: (),
+            events: (),
+            event_types: SmallVec::new(),
             resource_access: Permissions::default(),
             component_access: Permissions::default(),
             access_all_archetypes: false,
@@ -296,10 +319,11 @@ impl Default for SystemBuilder<(), ()> {
     }
 }
 
-impl<Q, R> SystemBuilder<Q, R>
+impl<Q, R, E> SystemBuilder<Q, R, E>
 where
     Q: 'static + Send + ConsFlatten,
     R: 'static + Send + ConsFlatten,
+    E: 'static + Send + ConsFlatten,
 {
     /// Provides a name to the system being built.
     pub fn with_name(self, name: SystemId) -> Self {
@@ -317,7 +341,7 @@ where
     pub fn with_query<V, F>(
         mut self,
         query: Query<V, F>,
-    ) -> SystemBuilder<<Q as ConsAppend<Query<V, F>>>::Output, R>
+    ) -> SystemBuilder<<Q as ConsAppend<Query<V, F>>>::Output, R, E>
     where
         V: IntoView,
         F: 'static + EntityFilter,
@@ -328,6 +352,8 @@ where
         SystemBuilder {
             name: self.name,
             queries: ConsAppend::append(self.queries, query),
+            events: self.events,
+            event_types: self.event_types,
             resources: self.resources,
             resource_access: self.resource_access,
             component_access: self.component_access,
@@ -339,7 +365,7 @@ where
     ///
     /// This will inform the dispatcher to not allow any writes access to this resource while
     /// this system is running. Parralel reads still occur during execution.
-    pub fn read_resource<T>(mut self) -> SystemBuilder<Q, <R as ConsAppend<Read<T>>>::Output>
+    pub fn read_resource<T>(mut self) -> SystemBuilder<Q, <R as ConsAppend<Read<T>>>::Output, E>
     where
         T: 'static + Resource,
         R: ConsAppend<Read<T>>,
@@ -350,6 +376,8 @@ where
         SystemBuilder {
             name: self.name,
             queries: self.queries,
+            events: self.events,
+            event_types: self.event_types,
             resources: ConsAppend::append(self.resources, Read::<T>::default()),
             resource_access: self.resource_access,
             component_access: self.component_access,
@@ -361,7 +389,7 @@ where
     ///
     /// This will inform the dispatcher to not allow any parallel access to this resource while
     /// this system is running.
-    pub fn write_resource<T>(mut self) -> SystemBuilder<Q, <R as ConsAppend<Write<T>>>::Output>
+    pub fn write_resource<T>(mut self) -> SystemBuilder<Q, <R as ConsAppend<Write<T>>>::Output, E>
     where
         T: 'static + Resource,
         R: ConsAppend<Write<T>>,
@@ -372,8 +400,31 @@ where
         SystemBuilder {
             name: self.name,
             queries: self.queries,
+            events: self.events,
+            event_types: self.event_types,
             resources: ConsAppend::append(self.resources, Write::<T>::default()),
             resource_access: self.resource_access,
+            component_access: self.component_access,
+            access_all_archetypes: self.access_all_archetypes,
+        }
+    }
+
+    /// Flag this event type as being required by this system.
+    pub fn request_event<T>(mut self) -> SystemBuilder<Q, R, <E as ConsAppend<Read<T>>>::Output>
+    where
+        T: 'static + Event,
+        E: ConsAppend<Read<T>>,
+        <E as ConsAppend<Read<T>>>::Output: ConsFlatten,
+    {
+        self.event_types.push(EventTypeId::of::<T>());
+
+        SystemBuilder {
+            name: self.name,
+            queries: self.queries,
+            resources: self.resources,
+            resource_access: self.resource_access,
+            events: ConsAppend::append(self.events, Read::<T>::default()),
+            event_types: self.event_types,
             component_access: self.component_access,
             access_all_archetypes: self.access_all_archetypes,
         }
@@ -426,13 +477,15 @@ where
     pub fn build<F>(
         self,
         run_fn: F,
-    ) -> System<<R as ConsFlatten>::Output, <Q as ConsFlatten>::Output, F>
+    ) -> System<E, <R as ConsFlatten>::Output, <Q as ConsFlatten>::Output, F>
     where
         <R as ConsFlatten>::Output: for<'a> ResourceSet<'a>,
+        <E as ConsFlatten>::Output: for<'a> EventSet<'a>,
         <Q as ConsFlatten>::Output: QuerySet,
         F: FnMut(
             &mut CommandBuffer,
             &mut SubWorld,
+            &<<E as ConsFlatten>::Output as EventSet<'static>>::Result,
             &mut <<R as ConsFlatten>::Output as ResourceSet<'static>>::Result,
             &mut <Q as ConsFlatten>::Output,
         ),
@@ -440,7 +493,9 @@ where
         System {
             name: self.name,
             run_fn,
+            _events: EventMarker(PhantomData),
             _resources: ResourceMarker(PhantomData),
+            event_types: self.event_types,
             queries: self.queries.flatten(),
             archetypes: if self.access_all_archetypes {
                 ArchetypeAccess::All
