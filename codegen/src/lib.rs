@@ -89,8 +89,6 @@ use syn::{
 /// }
 /// ```
 ///
-/// `for_each` and `par_for_each` systems can request attitional filters for their query via the
-/// `#[filter]` attribute.
 ///
 /// ```
 /// # use legion_codegen::system;
@@ -99,7 +97,6 @@ use syn::{
 /// # struct Velocity { x: f32 }
 /// # struct Time { seconds: f32 }
 /// #[system(for_each)]
-/// #[filter(maybe_changed::<Position>())]
 /// fn update_positions(pos: &mut Position, vel: &Velocity, #[resource] time: &Time) {
 ///     pos.x += vel.x * time.seconds;
 /// }
@@ -171,12 +168,8 @@ pub fn system(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 #[derive(thiserror::Error, Debug)]
 enum Error {
-    #[error("system types must be one of `simple`, `for_each` or `par_for_each`")]
-    UnexpectedSystemType(Span),
     #[error("duplicate system constructor function name")]
     DuplicateConstructorName,
-    #[error("duplicate system type")]
-    DuplicateSystemType,
     #[error("invalid key")]
     InvalidKey(Span),
     #[error("system functions must not recieve self")]
@@ -190,8 +183,6 @@ enum Error {
     InvalidArgument(Span),
     #[error("expected component type")]
     ExpectedComponentType(Span),
-    #[error("expected filter expression")]
-    ExpectedFilterExpression(Span),
     #[error(
         "system does not request any component access (sub-world will have no permissions), \
     consider using #[read_compnent(T)] or #[write_component(T)]"
@@ -204,7 +195,6 @@ enum Error {
 impl Error {
     fn span(&self) -> Span {
         match self {
-            Error::UnexpectedSystemType(span) => *span,
             Error::InvalidKey(span) => *span,
             Error::InvalidOptionArgument(span, _) => *span,
             Error::InvalidArgument(span) => *span,
@@ -221,38 +211,22 @@ impl Error {
 #[derive(Default)]
 struct SystemAttr {
     constructor_name: Option<Lit>,
-    system_type: Option<SystemType>,
 }
 
 impl SystemAttr {
-    fn new(constructor_name: Option<Lit>, system_type: Option<SystemType>) -> Self {
+    fn new(constructor_name: Option<Lit>) -> Self {
         Self {
             constructor_name,
-            system_type,
         }
     }
 
     fn parse_meta(meta: &Meta) -> Result<Self, Error> {
         let result = match meta {
-            Meta::Path(path) => {
-                let ident = path.get_ident().expect("expected system type");
-                if ident == "for_each" {
-                    Self::new(None, Some(SystemType::ForEach))
-                } else if ident == "par_for_each" {
-                    Self::new(None, Some(SystemType::ParForEach))
-                } else if ident == "simple" {
-                    Self::new(None, Some(SystemType::Simple))
-                } else {
-                    return Err(Error::UnexpectedSystemType(ident.span()));
-                }
-            }
             Meta::List(items) => {
                 let mut n = None;
-                let mut s = None;
                 for item in &items.nested {
                     let Self {
                         constructor_name,
-                        system_type,
                     } = match item {
                         syn::NestedMeta::Meta(meta) => Self::parse_meta(&meta)?,
                         syn::NestedMeta::Lit(_) => panic!("unexpected literal"),
@@ -262,19 +236,15 @@ impl SystemAttr {
                             return Err(Error::DuplicateConstructorName);
                         }
                     }
-                    if let Some(system_type) = system_type {
-                        if s.replace(system_type).is_some() {
-                            return Err(Error::DuplicateSystemType);
-                        }
-                    }
                 }
-                Self::new(n, s)
+                Self::new(n)
             }
             Meta::NameValue(name_value) => match name_value.path.get_ident().map(|ident| ident) {
-                Some(ident) if ident == "ctor" => Self::new(Some(name_value.lit.clone()), None),
+                Some(ident) if ident == "ctor" => Self::new(Some(name_value.lit.clone())),
                 Some(ident) => return Err(Error::InvalidKey(ident.span())),
                 _ => return Err(Error::InvalidKey(Span::call_site())),
             },
+            _ => return Err(Error::InvalidKey(Span::call_site())),
         };
 
         Ok(result)
@@ -288,6 +258,7 @@ struct Sig {
     read_resources: Vec<Type>,
     write_resources: Vec<Type>,
     events: Vec<Type>,
+    queries: Vec<Type>,
     state_args: Vec<Type>,
     generics: Generics,
 }
@@ -299,12 +270,13 @@ impl Sig {
         let mut read_resources = Vec::new();
         let mut write_resources = Vec::new();
         let mut events = Vec::new();
+        let mut queries = Vec::new();
         let mut state_args = Vec::new();
         for param in &mut item.inputs {
             match param {
                 syn::FnArg::Receiver(_) => return Err(Error::SelfNotAllowed),
-                syn::FnArg::Typed(arg) => match arg.ty.as_ref() {
-                    Type::Path(ty_path) => {
+                syn::FnArg::Typed(arg) => match (arg.pat.as_ref(), arg.ty.as_ref()) {
+                    (_, Type::Path(ty_path)) => {
                         let ident = &ty_path.path.segments[0].ident;
                         if ident == "Option" {
                             match &ty_path.path.segments[0].arguments {
@@ -342,7 +314,7 @@ impl Sig {
                             return Err(Error::InvalidArgument(ident.span()));
                         }
                     }
-                    Type::Reference(ty)
+                    (_, Type::Reference(ty))
                         if is_type(&ty.elem, &["CommandBuffer"])
                             || is_type(&ty.elem, &["legion", "CommandBuffer"])
                             || is_type(&ty.elem, &["legion", "systems", "CommandBuffer"]) =>
@@ -353,7 +325,7 @@ impl Sig {
                             parameters.push(Parameter::CommandBuffer);
                         }
                     }
-                    Type::Reference(ty)
+                    (_, Type::Reference(ty))
                         if is_type(&ty.elem, &["SubWorld"])
                             || is_type(&ty.elem, &["legion", "SubWorld"])
                             || is_type(&ty.elem, &["legion", "world", "SubWorld"]) =>
@@ -364,7 +336,7 @@ impl Sig {
                             parameters.push(Parameter::SubWorld);
                         }
                     }
-                    Type::Reference(ty)
+                    (_, Type::Reference(ty))
                         if is_type(&ty.elem, &["Entity"])
                             || is_type(&ty.elem, &["legion", "Entity"])
                             || is_type(&ty.elem, &["legion", "world", "Entity"]) =>
@@ -372,7 +344,7 @@ impl Sig {
                         parameters.push(Parameter::Component(query.len()));
                         query.push(parse_quote!(::legion::Entity));
                     }
-                    Type::Reference(ty) => {
+                    (_, Type::Reference(ty)) => {
                         let mutable = ty.mutability.is_some();
                         let resource = Self::find_remove_arg_attr(&mut arg.attrs);
                         match resource {
@@ -406,9 +378,20 @@ impl Sig {
                                     query.push(parse_quote!(::legion::Read<#elem>));
                                 }
                             }
+                            _ => return Err(Error::InvalidArgument(Span::call_site())),
                         }
                     }
-                    _ => return Err(Error::InvalidArgument(Span::call_site())),
+                    _ => {
+                        // Assume query
+                        let resource = Self::find_remove_arg_attr(&mut arg.attrs);
+                        if let Some(ArgAttr::Query) = resource {
+                            parameters.push(Parameter::Query(queries.len()));
+                            queries.push(arg.ty.as_ref().clone());
+                        } else {
+                            return Err(Error::InvalidArgument(Span::call_site()));
+                        }
+                    }
+                    //_ => return Err(Error::InvalidArgument(Span::call_site())),
                 },
             }
         }
@@ -421,6 +404,7 @@ impl Sig {
             read_resources,
             write_resources,
             events,
+            queries,
             state_args,
         })
     }
@@ -431,6 +415,10 @@ impl Sig {
                 Some(ident) if ident == "resource" => {
                     attributes.remove(i);
                     return Some(ArgAttr::Resource);
+                }
+                Some(ident) if ident == "query" => {
+                    attributes.remove(i);
+                    return Some(ArgAttr::Query);
                 }
                 Some(ident) if ident == "event" => {
                     attributes.remove(i);
@@ -449,6 +437,7 @@ impl Sig {
 
 enum ArgAttr {
     Resource,
+    Query,
     Event,
     State,
 }
@@ -464,23 +453,6 @@ fn is_type(ty: &Type, segments: &[&str]) -> bool {
     }
 }
 
-#[derive(Copy, Clone, PartialEq)]
-enum SystemType {
-    Simple,
-    ForEach,
-    ParForEach,
-}
-
-impl SystemType {
-    fn requires_query(&self) -> bool {
-        match self {
-            SystemType::Simple => false,
-            SystemType::ForEach => true,
-            SystemType::ParForEach => true,
-        }
-    }
-}
-
 enum Parameter {
     CommandBuffer,
     CommandBufferMut,
@@ -490,6 +462,7 @@ enum Parameter {
     Resource(usize),
     ResourceMut(usize),
     Event(usize),
+    Query(usize),
     State(usize),
     StateMut(usize),
 }
@@ -499,17 +472,15 @@ struct Config {
     visibility: Visibility,
     read_components: Vec<Type>,
     write_components: Vec<Type>,
-    filters: Vec<Expr>,
     signature: Sig,
 }
 
 impl Config {
     fn parse(attr: SystemAttr, item: &mut ItemFn) -> Result<Self, Error> {
-        // parse attributes, extract read/write component/resource and filters
+        // parse attributes, extract read/write component/resource
         let mut to_remove = Vec::new();
         let mut read_components = Vec::new();
         let mut write_components = Vec::new();
-        let mut filters = Vec::new();
         for (i, attribute) in item.attrs.iter().enumerate() {
             if let Some(ident) = attribute.path.get_ident() {
                 if ident == "read_component" {
@@ -524,13 +495,6 @@ impl Config {
                         .parse_args()
                         .map_err(|_| Error::ExpectedComponentType(ident.span()))?;
                     write_components.push(component);
-                    to_remove.push(i);
-                }
-                if ident == "filter" {
-                    let filter = attribute
-                        .parse_args()
-                        .map_err(|_| Error::ExpectedFilterExpression(ident.span()))?;
-                    filters.push(filter);
                     to_remove.push(i);
                 }
             }
@@ -549,24 +513,14 @@ impl Config {
             visibility: item.vis.clone(),
             read_components,
             write_components,
-            filters,
             signature,
         })
     }
 
     fn validate(&self) -> Result<(), Error> {
-        let system_type = self.attr.system_type.unwrap_or(SystemType::Simple);
-
         // validation
-        if !self.signature.query.is_empty() && system_type == SystemType::Simple {
+        if !self.signature.query.is_empty() {
             return Err(Error::Message("simple systems cannot contain component references, consider using `#[system(for_each)]`".to_string()));
-        }
-
-        if self.signature.query.is_empty() && system_type != SystemType::Simple {
-            return Err(Error::Message(
-                "for_each and par_for_each systems require at least one component parameter"
-                    .to_string(),
-            ));
         }
 
         if self.signature.generics.lifetimes().next().is_some() {
@@ -575,7 +529,6 @@ impl Config {
             ));
         }
 
-        if system_type == SystemType::Simple {
             let has_subworld = self
                 .signature
                 .parameters
@@ -591,41 +544,6 @@ impl Config {
             if (has_subworld || has_subworld_mut) && !has_components {
                 return Err(Error::SubworldWithoutPermissions);
             }
-        }
-
-        if system_type == SystemType::ParForEach {
-            if self
-                .signature
-                .parameters
-                .iter()
-                .any(|param| matches!(param, Parameter::SubWorldMut))
-            {
-                return Err(Error::Message(
-                    "par_for_each systems cannot accept mutable world references".to_string(),
-                ));
-            }
-            if self
-                .signature
-                .parameters
-                .iter()
-                .any(|param| matches!(param, Parameter::ResourceMut(_)))
-            {
-                return Err(Error::Message(
-                    "par_for_each systems cannot accept mutable resource references".to_string(),
-                ));
-            }
-            if self
-                .signature
-                .parameters
-                .iter()
-                .any(|param| matches!(param, Parameter::CommandBufferMut))
-            {
-                return Err(Error::Message(
-                    "par_for_each systems cannot accept mutable command buffer references"
-                        .to_string(),
-                ));
-            }
-        }
 
         Ok(())
     }
@@ -638,30 +556,15 @@ impl Config {
             visibility,
             read_components,
             write_components,
-            filters,
             signature,
         } = self;
-
-        let system_type = attr.system_type.unwrap_or(SystemType::Simple);
-
-        // declare query
-        let query = if system_type.requires_query() {
-            let views = &signature.query;
-            quote! {
-                .with_query(
-                    <(#(#views),*)>::query()
-                    #(.filter(#filters))*
-                )
-            }
-        } else {
-            quote!()
-        };
 
         // construct function arguments
         let has_query = !signature.query.is_empty();
         let single_resource =
             (signature.read_resources.len() + signature.write_resources.len()) == 1;
         let single_event = signature.events.len() == 1;
+        let single_query = signature.queries.len() == 1;
         let mut call_params = Vec::new();
         let mut fn_params = Vec::new();
         let mut world = None;
@@ -703,6 +606,11 @@ impl Config {
                     let idx = Index::from(*idx);
                     call_params.push(quote!(&*events.#idx));
                 }
+                Parameter::Query(_) if single_query => call_params.push(quote!(&*queries)),
+                Parameter::Query(idx) => {
+                    let idx = Index::from(*idx);
+                    call_params.push(quote!(&*queries.#idx));
+                }
                 Parameter::Resource(_) if single_resource => call_params.push(quote!(&*resources)),
                 Parameter::ResourceMut(_) if single_resource => {
                     call_params.push(quote!(&mut *resources))
@@ -738,21 +646,7 @@ impl Config {
             .map(|param| param.ident.clone());
         let fn_call = quote!(#fn_id::<#(#type_params),*>(#(#call_params),*););
         let world = world.unwrap_or_else(|| quote!(let for_query = world;));
-        let body = match system_type {
-            SystemType::Simple => fn_call,
-            SystemType::ForEach => quote! {
-                #world
-                query.for_each_mut(for_query, |components| {
-                    #fn_call
-                });
-            },
-            SystemType::ParForEach => quote! {
-                #world
-                query.par_for_each_mut(for_query, |components| {
-                    #fn_call
-                });
-            },
-        };
+        let body = fn_call;
 
         // construct our system
         let system_name = fn_id.to_string();
@@ -773,6 +667,7 @@ impl Config {
         let read_resources = &signature.read_resources;
         let write_resources = &signature.write_resources;
         let events = &signature.events;
+        let queries = &signature.queries;
         let builder = quote! {
             use legion::IntoQuery;
             #generic_parameter_names
@@ -782,7 +677,7 @@ impl Config {
                 #(.read_resource::<#read_resources>())*
                 #(.write_resource::<#write_resources>())*
                 #(.request_event::<#events>())*
-                #query
+                #(.with_query(#queries))*
                 .build(move |cmd, world, events, resources, query| {
                     #body
                 })

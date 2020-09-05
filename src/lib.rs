@@ -202,7 +202,7 @@ pub use crate::{
         Write,
     },
     storage::{GroupSource, IntoSoa},
-    systems::{Resources, Schedule, SystemBuilder, Events},
+    systems::{Resources, Schedule, SystemBuilder, Events, SystemResult},
     world::{Entity, EntityStore, World, WorldOptions},
 };
 

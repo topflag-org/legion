@@ -9,5 +9,5 @@ pub use crate::internals::systems::{
         Fetch, Resource, ResourceSet, ResourceTypeId, Resources, SyncResources, UnsafeResources,
     },
     schedule::{Builder, Executor, ParallelRunnable, Runnable, Schedule, Step},
-    system::{QuerySet, System, SystemAccess, SystemBuilder, SystemFn, SystemId},
+    system::{QuerySet, System, SystemAccess, SystemBuilder, SystemFn, SystemId, SystemResult},
 };

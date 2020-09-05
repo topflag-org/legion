@@ -22,9 +22,13 @@ use crate::internals::{
     world::{World, WorldId},
 };
 use bit_set::BitSet;
-use std::{any::TypeId, borrow::Cow, collections::HashMap, marker::PhantomData};
+use std::{any::{Any, TypeId}, borrow::Cow, collections::HashMap, error::Error, marker::PhantomData};
 use tracing::{debug, info, span, Level};
 use smallvec::SmallVec;
+
+/// Result of the execution of a system.
+/// Returns a SmallVec of events, or an error.
+pub type SystemResult = Result<SmallVec<[Box<dyn Event>; 4]>, Box<dyn Error>>;
 
 /// Provides an abstraction across tuples of queries for system closures.
 pub trait QuerySet: Send + Sync {
@@ -181,7 +185,7 @@ where
         self.command_buffer.get_mut(&world)
     }
 
-    unsafe fn run_unsafe(&mut self, world: &World, events: &UnsafeEvents, resources: &UnsafeResources) {
+    unsafe fn run_unsafe(&mut self, world: &World, events: &UnsafeEvents, resources: &UnsafeResources) -> SystemResult {
         let span = if let Some(name) = &self.name {
             span!(Level::INFO, "System", system = %name)
         } else {
@@ -215,7 +219,7 @@ where
 
         info!("Running");
         let borrow = &mut self.run_fn;
-        borrow.run(cmd, &mut world_shim, &events, &mut resources, queries);
+        borrow.run(cmd, &mut world_shim, &events, &mut resources, queries)
     }
 }
 
@@ -229,7 +233,7 @@ pub trait SystemFn<E: EventSet<'static>, R: ResourceSet<'static>, Q: QuerySet> {
         events: &E::Result,
         resources: &mut R::Result,
         queries: &mut Q,
-    );
+    ) -> SystemResult;
 }
 
 impl<E, F, R, Q> SystemFn<E, R, Q> for F
@@ -237,7 +241,7 @@ where
     E: EventSet<'static>,
     R: ResourceSet<'static>,
     Q: QuerySet,
-    F: FnMut(&mut CommandBuffer, &mut SubWorld, &E::Result, &mut R::Result, &mut Q) + 'static,
+    F: FnMut(&mut CommandBuffer, &mut SubWorld, &E::Result, &mut R::Result, &mut Q) -> SystemResult + 'static,
 {
     fn run(
         &mut self,
@@ -246,7 +250,7 @@ where
         events: &E::Result,
         resources: &mut R::Result,
         queries: &mut Q,
-    ) {
+    ) -> SystemResult {
         (self)(commands, world, events, resources, queries)
     }
 }
@@ -488,7 +492,7 @@ where
             &<<E as ConsFlatten>::Output as EventSet<'static>>::Result,
             &mut <<R as ConsFlatten>::Output as ResourceSet<'static>>::Result,
             &mut <Q as ConsFlatten>::Output,
-        ),
+        ) -> SystemResult,
     {
         System {
             name: self.name,
@@ -510,3 +514,4 @@ where
         }
     }
 }
+

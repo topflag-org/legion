@@ -21,7 +21,7 @@ use super::{
     command::CommandBuffer,
     resources::{ResourceTypeId, Resources, UnsafeResources},
     events::{EventTypeId, Events, UnsafeEvents},
-    system::SystemId,
+    system::{SystemId, SystemResult},
 };
 use crate::internals::{
     storage::component::ComponentTypeId,
@@ -66,7 +66,7 @@ pub trait Runnable {
     ///
     /// Additionally, systems which are !Sync should never be invoked on a different thread to that which
     /// owns the resources collection passed into this function.
-    unsafe fn run_unsafe(&mut self, world: &World, events: &UnsafeEvents, resources: &UnsafeResources);
+    unsafe fn run_unsafe(&mut self, world: &World, events: &UnsafeEvents, resources: &UnsafeResources) -> SystemResult;
 
     /// Gets the system's command buffer.
     fn command_buffer_mut(&mut self, world: WorldId) -> Option<&mut CommandBuffer>;
@@ -618,6 +618,7 @@ mod tests {
     };
     use itertools::sorted;
     use std::sync::{Arc, Mutex};
+    use smallvec::SmallVec;
 
     #[test]
     fn execute_in_order() {
@@ -635,15 +636,15 @@ mod tests {
         let order_clone = order.clone();
         let system_one = SystemBuilder::new("one")
             .write_resource::<Resource>()
-            .build(move |_, _, _, _, _| order_clone.lock().unwrap().push(1usize));
+            .build(move |_, _, _, _, _| {order_clone.lock().unwrap().push(1usize);Ok(SmallVec::new())});
         let order_clone = order.clone();
         let system_two = SystemBuilder::new("two")
             .write_resource::<Resource>()
-            .build(move |_, _, _, _, _| order_clone.lock().unwrap().push(2usize));
+            .build(move |_, _, _, _, _| {order_clone.lock().unwrap().push(2usize);Ok(SmallVec::new())});
         let order_clone = order.clone();
         let system_three = SystemBuilder::new("three")
             .write_resource::<Resource>()
-            .build(move |_, _, _, _, _| order_clone.lock().unwrap().push(3usize));
+            .build(move |_, _, _, _, _| {order_clone.lock().unwrap().push(3usize);Ok(SmallVec::new())});
 
         let mut schedule = Schedule::builder()
             .add_system(system_one)
@@ -669,16 +670,19 @@ mod tests {
 
         let system_one = SystemBuilder::new("one").build(move |cmd, _, _, _, _| {
             cmd.push((TestComp(0., 0., 0.),));
+            Ok(SmallVec::new())
         });
         let system_two = SystemBuilder::new("two")
             .with_query(Write::<TestComp>::query())
             .build(move |_, world, _, _, query| {
                 assert_eq!(0, query.iter_mut(world).count());
+                Ok(SmallVec::new())
             });
         let system_three = SystemBuilder::new("three")
             .with_query(Write::<TestComp>::query())
             .build(move |_, world, _, _, query| {
                 assert_eq!(1, query.iter_mut(world).count());
+                Ok(SmallVec::new())
             });
 
         let mut schedule = Schedule::builder()
@@ -708,6 +712,7 @@ mod tests {
             let system_one = SystemBuilder::new("one").build(move |cmd, _, _, _, _| {
                 let mut entity = entity.lock().unwrap();
                 *entity = Some(cmd.push((TestComp(0.0, 0.0, 0.0),)));
+                Ok(SmallVec::new())
             });
 
             let mut schedule = Schedule::builder().add_thread_local(system_one).build();
@@ -734,7 +739,7 @@ mod tests {
 
         let system = SystemBuilder::new("one")
             .read_resource::<NotSync>()
-            .build(move |_, _, _, _, _| {});
+            .build(move |_, _, _, _, _| {Ok(SmallVec::new())});
 
         let mut schedule = Schedule::builder().add_thread_local(system).build();
 
