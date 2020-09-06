@@ -183,6 +183,8 @@ enum Error {
     InvalidArgument(Span),
     #[error("expected component type")]
     ExpectedComponentType(Span),
+    #[error("expected query type")]
+    ExpectedQueryType(Span),
     #[error(
         "system does not request any component access (sub-world will have no permissions), \
     consider using #[read_compnent(T)] or #[write_component(T)]"
@@ -254,11 +256,9 @@ impl SystemAttr {
 struct Sig {
     ident: Ident,
     parameters: Vec<Parameter>,
-    query: Vec<Type>,
     read_resources: Vec<Type>,
     write_resources: Vec<Type>,
     events: Vec<Type>,
-    queries: Vec<Type>,
     state_args: Vec<Type>,
     generics: Generics,
 }
@@ -266,53 +266,31 @@ struct Sig {
 impl Sig {
     fn parse(item: &mut Signature) -> Result<Self, Error> {
         let mut parameters = Vec::new();
-        let mut query = Vec::<Type>::new();
+        //let mut query = Vec::<Type>::new();
         let mut read_resources = Vec::new();
         let mut write_resources = Vec::new();
         let mut events = Vec::new();
-        let mut queries = Vec::new();
+        //let mut queries = Vec::new();
         let mut state_args = Vec::new();
-        for param in &mut item.inputs {
+        //let mut delet_idx = Vec::new();
+        //let mut query_names = Vec::new();
+        for (idx, param) in &mut item.inputs.iter_mut().enumerate() {
             match param {
                 syn::FnArg::Receiver(_) => return Err(Error::SelfNotAllowed),
                 syn::FnArg::Typed(arg) => match (arg.pat.as_ref(), arg.ty.as_ref()) {
-                    (_, Type::Path(ty_path)) => {
-                        let ident = &ty_path.path.segments[0].ident;
-                        if ident == "Option" {
-                            match &ty_path.path.segments[0].arguments {
-                                PathArguments::AngleBracketed(bracketed) => {
-                                    let arg = bracketed.args.iter().next().unwrap();
-                                    match arg {
-                                        GenericArgument::Type(ty) => match ty {
-                                            Type::Reference(ty) => {
-                                                let mutable = ty.mutability.is_some();
-                                                parameters.push(Parameter::Component(query.len()));
-                                                let elem = &ty.elem;
-                                                if mutable {
-                                                    query.push(
-                                                        parse_quote!(::legion::TryWrite<#elem>),
-                                                    );
-                                                } else {
-                                                    query.push(
-                                                        parse_quote!(::legion::TryRead<#elem>),
-                                                    );
-                                                }
-                                            }
-                                            _ => {
-                                                return Err(Error::InvalidOptionArgument(
-                                                    ident.span(),
-                                                    quote!(#ty).to_string(),
-                                                ))
-                                            }
-                                        },
-                                        _ => panic!(),
-                                    }
-                                }
-                                _ => panic!(),
+                    /*(_, Type::Path(ty_path)) => {
+                        if let Some(path) = ty_path.path.segments.last() {
+                            if path.ident == "QuerySet" {
+                                parameters.push(Parameter::Query);
                             }
                         } else {
-                            return Err(Error::InvalidArgument(ident.span()));
+                            return Err(Error::InvalidArgument(Span::call_site()));
                         }
+                    }*/
+                    (_, Type::Reference(ty))
+                        if is_type(&ty.elem, &["Queries"]) =>
+                    {
+                        parameters.push(Parameter::Query);
                     }
                     (_, Type::Reference(ty))
                         if is_type(&ty.elem, &["CommandBuffer"])
@@ -335,14 +313,6 @@ impl Sig {
                         } else {
                             parameters.push(Parameter::SubWorld);
                         }
-                    }
-                    (_, Type::Reference(ty))
-                        if is_type(&ty.elem, &["Entity"])
-                            || is_type(&ty.elem, &["legion", "Entity"])
-                            || is_type(&ty.elem, &["legion", "world", "Entity"]) =>
-                    {
-                        parameters.push(Parameter::Component(query.len()));
-                        query.push(parse_quote!(::legion::Entity));
                     }
                     (_, Type::Reference(ty)) => {
                         let mutable = ty.mutability.is_some();
@@ -369,27 +339,11 @@ impl Sig {
                                 }
                                 state_args.push(ty.elem.as_ref().clone());
                             }
-                            None => {
-                                parameters.push(Parameter::Component(query.len()));
-                                let elem = &ty.elem;
-                                if mutable {
-                                    query.push(parse_quote!(::legion::Write<#elem>));
-                                } else {
-                                    query.push(parse_quote!(::legion::Read<#elem>));
-                                }
-                            }
                             _ => return Err(Error::InvalidArgument(Span::call_site())),
                         }
                     }
                     _ => {
-                        // Assume query
-                        let resource = Self::find_remove_arg_attr(&mut arg.attrs);
-                        if let Some(ArgAttr::Query) = resource {
-                            parameters.push(Parameter::Query(queries.len()));
-                            queries.push(arg.ty.as_ref().clone());
-                        } else {
-                            return Err(Error::InvalidArgument(Span::call_site()));
-                        }
+                        return Err(Error::InvalidArgument(Span::call_site()));
                     }
                     //_ => return Err(Error::InvalidArgument(Span::call_site())),
                 },
@@ -400,11 +354,9 @@ impl Sig {
             ident: item.ident.clone(),
             generics: item.generics.clone(),
             parameters,
-            query,
             read_resources,
             write_resources,
             events,
-            queries,
             state_args,
         })
     }
@@ -458,11 +410,10 @@ enum Parameter {
     CommandBufferMut,
     SubWorld,
     SubWorldMut,
-    Component(usize),
     Resource(usize),
     ResourceMut(usize),
+    Query,
     Event(usize),
-    Query(usize),
     State(usize),
     StateMut(usize),
 }
@@ -472,6 +423,7 @@ struct Config {
     visibility: Visibility,
     read_components: Vec<Type>,
     write_components: Vec<Type>,
+    queries: Vec<Expr>,
     signature: Sig,
 }
 
@@ -481,6 +433,7 @@ impl Config {
         let mut to_remove = Vec::new();
         let mut read_components = Vec::new();
         let mut write_components = Vec::new();
+        let mut queries = Vec::new();
         for (i, attribute) in item.attrs.iter().enumerate() {
             if let Some(ident) = attribute.path.get_ident() {
                 if ident == "read_component" {
@@ -497,6 +450,13 @@ impl Config {
                     write_components.push(component);
                     to_remove.push(i);
                 }
+                if ident == "query" {
+                    let query = attribute
+                        .parse_args()
+                        .map_err(|_| Error::ExpectedQueryType(ident.span()))?;
+                    queries.push(query);
+                    to_remove.push(i);
+                }
             }
         }
 
@@ -511,6 +471,7 @@ impl Config {
         Ok(Config {
             attr,
             visibility: item.vis.clone(),
+            queries,
             read_components,
             write_components,
             signature,
@@ -519,10 +480,6 @@ impl Config {
 
     fn validate(&self) -> Result<(), Error> {
         // validation
-        if !self.signature.query.is_empty() {
-            return Err(Error::Message("simple systems cannot contain component references, consider using `#[system(for_each)]`".to_string()));
-        }
-
         if self.signature.generics.lifetimes().next().is_some() {
             return Err(Error::Message(
                 "system functions must not contain lifetime generic parameters".to_string(),
@@ -556,15 +513,15 @@ impl Config {
             visibility,
             read_components,
             write_components,
+            queries,
             signature,
         } = self;
 
         // construct function arguments
-        let has_query = !signature.query.is_empty();
+        //let has_query = !signature.query.is_empty();
         let single_resource =
             (signature.read_resources.len() + signature.write_resources.len()) == 1;
         let single_event = signature.events.len() == 1;
-        let single_query = signature.queries.len() == 1;
         let mut call_params = Vec::new();
         let mut fn_params = Vec::new();
         let mut world = None;
@@ -573,44 +530,25 @@ impl Config {
                 Parameter::CommandBuffer => call_params.push(quote!(cmd)),
                 Parameter::CommandBufferMut => call_params.push(quote!(cmd)),
                 Parameter::SubWorld => {
-                    if has_query {
-                        call_params.push(quote!(&world));
-                    } else {
                         call_params.push(quote!(world));
-                    }
                     world = Some(quote! {
                         let (mut for_query, world) = world.split_for_query(query);
                         let for_query = &mut for_query;
                     });
                 }
                 Parameter::SubWorldMut => {
-                    if has_query {
-                        call_params.push(quote!(&mut world));
-                    } else {
                         call_params.push(quote!(world));
-                    }
                     world = Some(quote! {
                         let (mut for_query, mut world) = world.split_for_query(query);
                         let for_query = &mut for_query;
                     });
-                }
-                Parameter::Component(_) if signature.query.len() == 1 => {
-                    call_params.push(quote!(components))
-                }
-                Parameter::Component(idx) => {
-                    let idx = Index::from(*idx);
-                    call_params.push(quote!(components.#idx));
                 }
                 Parameter::Event(_) if single_event => call_params.push(quote!(&*events)),
                 Parameter::Event(idx) => {
                     let idx = Index::from(*idx);
                     call_params.push(quote!(&*events.#idx));
                 }
-                Parameter::Query(_) if single_query => call_params.push(quote!(&*queries)),
-                Parameter::Query(idx) => {
-                    let idx = Index::from(*idx);
-                    call_params.push(quote!(&*queries.#idx));
-                }
+                Parameter::Query => call_params.push(quote!(&*query)),
                 Parameter::Resource(_) if single_resource => call_params.push(quote!(&*resources)),
                 Parameter::ResourceMut(_) if single_resource => {
                     call_params.push(quote!(&mut *resources))
@@ -667,7 +605,8 @@ impl Config {
         let read_resources = &signature.read_resources;
         let write_resources = &signature.write_resources;
         let events = &signature.events;
-        let queries = &signature.queries;
+        //let queries = &signature.queries;
+        let queries = &self.queries;
         let builder = quote! {
             use legion::IntoQuery;
             #generic_parameter_names

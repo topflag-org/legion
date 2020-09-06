@@ -29,6 +29,8 @@ use smallvec::SmallVec;
 /// Result of the execution of a system.
 /// Returns a SmallVec of events, or an error.
 pub type SystemResult = Result<SmallVec<[Box<dyn Event>; 4]>, Box<dyn Error>>;
+// TODO
+//pub type SystemResult = Result<SmallVec<[(EventTypeId, Box<dyn Event>); 4]>, Box<dyn Error>>;
 
 /// Provides an abstraction across tuples of queries for system closures.
 pub trait QuerySet: Send + Sync {
